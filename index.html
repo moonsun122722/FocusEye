@@ -1,0 +1,289 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>FocusEye — Classroom Detector (Multi)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; text-align:center; margin:12px; }
+    #controls { margin-bottom:8px; }
+    #video, #overlay { border-radius:6px; }
+    #overlay { position:absolute; left:0; top:0; pointer-events:none; }
+    #container { position:relative; display:inline-block; }
+    button { margin:4px; padding:8px 12px; }
+    #log { text-align:left; max-height:150px; overflow:auto; margin-top:8px; font-size:13px; background:#fff; padding:8px; border-radius:6px; border:1px solid #ddd; }
+  </style>
+
+  <!-- TensorFlow + face-landmarks in browser -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@0.0.7/dist/face-landmarks-detection.min.js"></script>
+</head>
+<body>
+  <h2>FocusEye — Classroom Attention Tracker</h2>
+
+  <div id="controls">
+    Firebase DB URL:
+    <input id="firebaseUrl" placeholder="https://your-project-default-rtdb.firebaseio.com" size="40"/>
+    <button id="startBtn">Start Camera</button>
+    <button id="registerBtn" disabled>Register Students (by seat)</button>
+    <button id="clearRegBtn" disabled>Clear Registration</button>
+    <span id="status" style="margin-left:12px;font-weight:bold">stopped</span>
+  </div>
+
+  <div id="container">
+    <video id="video" width="800" height="600" autoplay muted playsinline></video>
+    <canvas id="overlay" width="800" height="600"></canvas>
+  </div>
+
+  <div id="log"></div>
+
+<script>
+(async ()=>{
+  // ---------- UI elements ----------
+  const startBtn = document.getElementById('startBtn');
+  const registerBtn = document.getElementById('registerBtn');
+  const clearRegBtn = document.getElementById('clearRegBtn');
+  const firebaseInput = document.getElementById('firebaseUrl');
+  const statusSpan = document.getElementById('status');
+  const logDiv = document.getElementById('log');
+
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('overlay');
+  const ctx = canvas.getContext('2d');
+
+  // ---------- Config (tweak if needed) ----------
+  const MAX_FACES = 20;
+  const YAW_THRESH = 0.28;   // how far nose can deviate horizontally (normalized) before considered turned
+  const PITCH_THRESH = 0.40; // vertical offset threshold
+  const MATCH_DIST_PX = 120; // pixels threshold for matching a detected face to a registered seat
+  const SEND_INTERVAL_MS = 5000;
+
+  // ---------- state ----------
+  let model = null;
+  let camOn = false;
+  let lastSendTimes = {}; // name -> last send ms
+  let lastStatus = {};    // name -> "focused"/"distracted"
+  let registered = {};    // name -> {x:..., y:...} seat centers (saved in localStorage)
+  const REG_KEY = 'focuseye_registered_positions';
+
+  // load prior registration if any
+  try {
+    const s = localStorage.getItem(REG_KEY);
+    if (s) registered = JSON.parse(s);
+    if (Object.keys(registered).length) {
+      registerBtn.disabled = false;
+      clearRegBtn.disabled = false;
+      log('Loaded saved registration for ' + Object.keys(registered).length + ' students.');
+    }
+  } catch(e){ /* ignore */ }
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logDiv.innerHTML = `<div>[${t}] ${msg}</div>` + logDiv.innerHTML;
+  }
+
+  // ---------- helpers: Firebase REST writes ----------
+  function firebaseUrlFor(path) {
+    let base = (document.getElementById('firebaseUrl').value || '').trim();
+    if (!base) return null;
+    if (base.endsWith('/')) base = base.slice(0,-1);
+    return `${base}/${path}.json`;
+  }
+
+  async function sendStudentStatus(name, obj) {
+    const url = firebaseUrlFor(`class1/students/${encodeURIComponent(name)}`);
+    const logUrl = firebaseUrlFor(`class1/logs/${Date.now()}`);
+    if (!url) return;
+    try {
+      // Store current status object (PUT)
+      await fetch(url, { method:'PUT', body: JSON.stringify(obj), headers: {'Content-Type':'application/json'} });
+      // Append log entry (PUT keyed by timestamp)
+      await fetch(logUrl, { method:'PUT', body: JSON.stringify({ student: name, ...obj }), headers: {'Content-Type':'application/json'} });
+    } catch(e) {
+      console.warn('Firebase write failed', e);
+    }
+  }
+
+  // ---------- camera + model ----------
+  async function setupCamera() {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }});
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+  }
+
+  // Use face-landmarks-detection (MediaPipe facemesh)
+  async function loadModel() {
+    statusSpan.textContent = 'loading model...';
+    model = await faceLandmarksDetection.load(faceLandmarksDetection.SupportedPackages.mediapipeFacemesh);
+    statusSpan.textContent = 'model loaded';
+  }
+
+  // compute facing rule from landmarks scaledMesh (per face)
+  function computeFacingFromMesh(mesh) {
+    // we rely on MediaPipe indices:
+    // left eye ~ 33, right eye ~263, nose tip ~1
+    if (!mesh || mesh.length < 300) return {facing: true, yaw:0, pitch:0};
+    const left = mesh[33];
+    const right = mesh[263];
+    const nose = mesh[1];
+    const midEyeX = (left[0] + right[0]) / 2;
+    const midEyeY = (left[1] + right[1]) / 2;
+    const dx = (nose[0] - midEyeX);
+    const dy = (nose[1] - midEyeY);
+    const faceWidth = Math.max(1, Math.abs(right[0] - left[0]));
+    const yaw = dx / faceWidth;
+    const pitch = dy / faceWidth;
+    const facing = Math.abs(yaw) < YAW_THRESH && Math.abs(pitch) < PITCH_THRESH;
+    return { facing, yaw: Number(yaw.toFixed(3)), pitch: Number(pitch.toFixed(3)) };
+  }
+
+  function centerOfBox(topLeft, bottomRight) {
+    const cx = (topLeft[0] + bottomRight[0]) / 2;
+    const cy = (topLeft[1] + bottomRight[1]) / 2;
+    return {x: cx, y: cy};
+  }
+
+  function matchToRegistered(center) {
+    let bestName = null;
+    let bestDist = Infinity;
+    for (const [name,pos] of Object.entries(registered)) {
+      const dx = pos.x - center.x;
+      const dy = pos.y - center.y;
+      const d = Math.hypot(dx,dy);
+      if (d < bestDist) { bestDist = d; bestName = name; }
+    }
+    if (bestDist <= MATCH_DIST_PX) return bestName;
+    return null;
+  }
+
+  // main detection loop
+  async function detectLoop() {
+    if (!model || !camOn) return;
+    // estimate faces (flipHorizontal true so it feels like mirror)
+    const preds = await model.estimateFaces({input: video, returnTensors:false, flipHorizontal: false});
+    // draw video as background
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    if (preds && preds.length) {
+      for (let i=0;i<preds.length;i++) {
+        const p = preds[i];
+        // p has: topLeft, bottomRight, scaledMesh
+        const tl = p.topLeft;
+        const br = p.bottomRight;
+        const boxW = br[0] - tl[0];
+        const boxH = br[1] - tl[1];
+        const center = centerOfBox(tl, br);
+
+        // draw box
+        ctx.beginPath();
+        ctx.rect(tl[0], tl[1], boxW, boxH);
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'lime';
+        ctx.stroke();
+
+        // compute facing using mesh
+        const mesh = p.scaledMesh;
+        const res = computeFacingFromMesh(mesh);
+        const state = res.facing ? "Focused" : "Distracted";
+
+        // assign name by registration (if present)
+        const name = matchToRegistered(center) || (`Student ${i+1}`);
+        // label on top-left of box
+        ctx.fillStyle = res.facing ? 'green' : 'orange';
+        ctx.font = "16px Arial";
+        const label = `${name}: ${state}`;
+        ctx.fillText(label, tl[0], Math.max(12, tl[1]-6));
+
+        // draw small circle at center
+        ctx.beginPath();
+        ctx.arc(center.x, center.y, 3, 0, Math.PI*2);
+        ctx.fill();
+
+        // send to firebase only if registered (to avoid anonymous spam)
+        if (registered[name]) {
+          const now = Date.now();
+          const last = lastSendTimes[name]||0;
+          const prevStatus = lastStatus[name]||null;
+          if (prevStatus !== state || (now - last) > SEND_INTERVAL_MS) {
+            // send status object
+            const obj = { status: state.toLowerCase(), ts: new Date().toISOString(), x: Math.round(center.x), y: Math.round(center.y), yaw: res.yaw, pitch: res.pitch };
+            sendStudentStatus(name, obj); // async fire-and-forget
+            lastSendTimes[name] = now;
+            lastStatus[name] = state;
+            log(`Sent ${name} = ${state}`);
+          }
+        }
+      }
+      statusSpan.textContent = `Detected ${preds.length} face(s)`;
+    } else {
+      statusSpan.textContent = 'No faces detected';
+    }
+
+    requestAnimationFrame(detectLoop);
+  }
+
+  // ---------- registration flow ----------
+  async function registerStudentsInteractive() {
+    if (!model) return alert('Model not loaded.');
+    // take one frame detect
+    const preds = await model.estimateFaces({input: video, returnTensors:false, flipHorizontal: false});
+    if (!preds || preds.length === 0) return alert('No faces detected — ensure camera sees the class.');
+    // show prompt for each face
+    for (let i=0;i<preds.length;i++) {
+      const p = preds[i];
+      const center = centerOfBox(p.topLeft, p.bottomRight);
+      const suggested = `Seat ${i+1}`;
+      const name = prompt(`Enter name for detected face ${i+1} (leave blank to skip) — suggested: ${suggested}`, suggested);
+      if (name && name.trim()) {
+        registered[name.trim()] = { x: Math.round(center.x), y: Math.round(center.y) };
+        log(`Registered "${name.trim()}" at (${Math.round(center.x)},${Math.round(center.y)})`);
+      }
+    }
+    // save to localStorage and enable
+    localStorage.setItem(REG_KEY, JSON.stringify(registered));
+    registerBtn.disabled = false;
+    clearRegBtn.disabled = false;
+    alert('Registration saved. You can adjust MATCH_DIST_PX inside the code if matching fails for some seats.');
+  }
+
+  // ---------- clear registration ----------
+  function clearRegistration() {
+    if (!confirm('Clear saved registrations?')) return;
+    registered = {};
+    localStorage.removeItem(REG_KEY);
+    registerBtn.disabled = false;
+    clearRegBtn.disabled = true;
+    log('Cleared registration.');
+  }
+
+  // ---------- UI events ----------
+  startBtn.addEventListener('click', async ()=>{
+    const fb = firebaseInput.value.trim();
+    if (!fb) { alert('Enter Firebase DB URL first (Realtime DB)'); return; }
+    startBtn.disabled = true;
+    try {
+      await setupCamera();
+      await loadModel();
+      camOn = true;
+      registerBtn.disabled = false;
+      clearRegBtn.disabled = Object.keys(registered).length === 0;
+      detectLoop();
+      statusSpan.textContent = 'Running';
+      log('Camera started. Detection running.');
+    } catch (err) {
+      console.error(err);
+      alert('Error starting camera/model. See console.');
+      startBtn.disabled = false;
+    }
+  });
+
+  registerBtn.addEventListener('click', registerStudentsInteractive);
+  clearRegBtn.addEventListener('click', clearRegistration);
+
+})(); // IIFE
+</script>
+</body>
+</html>
