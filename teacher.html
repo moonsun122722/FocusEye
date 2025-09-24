@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>FocusEye — Teacher Dashboard</title>
+  <style> body{font-family:Arial;padding:12px;} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:8px} </style>
+</head>
+<body>
+  <h2>FocusEye — Teacher Dashboard</h2>
+  Firebase DB URL: <input id="firebaseUrl" size="60" placeholder="https://your-project-default-rtdb.firebaseio.com"/>
+  <button id="loadBtn">Load Current Students</button>
+  <button id="loadLogsBtn">Load Logs</button>
+  <button id="exportCSVBtn">Export Logs as CSV</button>
+  <div id="status"></div>
+  <h3>Students</h3>
+  <div id="students"></div>
+  <h3>Logs</h3>
+  <div id="logs" style="max-height:300px;overflow:auto;background:#fff;padding:8px;border-radius:6px;border:1px solid #ddd"></div>
+
+<script>
+  const loadBtn = document.getElementById('loadBtn');
+  const loadLogsBtn = document.getElementById('loadLogsBtn');
+  const exportCSVBtn = document.getElementById('exportCSVBtn');
+  const firebaseInput = document.getElementById('firebaseUrl');
+  const statusDiv = document.getElementById('status');
+  const studentsDiv = document.getElementById('students');
+  const logsDiv = document.getElementById('logs');
+
+  let lastLogsObj = null;
+
+  function fbUrl(path) {
+    let base = (firebaseInput.value || '').trim();
+    if (!base) return null;
+    if (base.endsWith('/')) base = base.slice(0,-1);
+    return `${base}/${path}.json`;
+  }
+
+  async function loadStudents() {
+    const url = fbUrl('class1/students');
+    if (!url) return alert('Enter Firebase DB URL');
+    statusDiv.textContent = 'Loading students...';
+    const res = await fetch(url);
+    const data = await res.json();
+    studentsDiv.innerHTML = '';
+    if (!data) { studentsDiv.textContent = 'No students data'; statusDiv.textContent=''; return; }
+    const table = document.createElement('table');
+    table.innerHTML = '<tr><th>Name</th><th>Status</th><th>Last seen</th><th>Position (x,y)</th></tr>';
+    for (const [name,obj] of Object.entries(data)) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${name}</td><td>${obj.status || ''}</td><td>${obj.ts || ''}</td><td>${obj.x||''}, ${obj.y||''}</td>`;
+      table.appendChild(tr);
+    }
+    studentsDiv.appendChild(table);
+    statusDiv.textContent = 'Loaded students.';
+  }
+
+  async function loadLogs() {
+    const url = fbUrl('class1/logs');
+    if (!url) return alert('Enter Firebase DB URL');
+    statusDiv.textContent = 'Loading logs...';
+    const res = await fetch(url);
+    const data = await res.json();
+    lastLogsObj = data;
+    logsDiv.innerHTML = '';
+    if (!data) { logsDiv.textContent='No logs'; statusDiv.textContent=''; return; }
+    const keys = Object.keys(data).sort().reverse();
+    for (const k of keys) {
+      const e = data[k];
+      logsDiv.innerHTML += `<div><b>${k}</b> — ${e.student} — ${e.status} — ${e.ts}</div>`;
+    }
+    statusDiv.textContent = 'Loaded logs.';
+  }
+
+  function exportLogsCSV() {
+    if (!lastLogsObj) return alert('Load logs first');
+    const keys = Object.keys(lastLogsObj).sort();
+    const rows = [['key','student','status','ts','x','y','yaw','pitch']];
+    for (const k of keys) {
+      const e = lastLogsObj[k];
+      rows.push([k, e.student||'', e.status||'', e.ts||'', e.x||'', e.y||'', e.yaw||'', e.pitch||'']);
+    }
+    const csv = rows.map(r => r.map(x=>`"${String(x).replace(/"/g,'""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv],{type:'text/csv'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'focuseye_logs.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  loadBtn.addEventListener('click', loadStudents);
+  loadLogsBtn.addEventListener('click', loadLogs);
+  exportCSVBtn.addEventListener('click', exportLogsCSV);
+
+</script>
+</body>
+</html>
